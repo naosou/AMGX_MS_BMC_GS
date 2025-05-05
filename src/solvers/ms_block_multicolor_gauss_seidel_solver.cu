@@ -17,44 +17,50 @@
 
 namespace amgx {
 
-template <class T_Config>
-MSBlockMultiColorGSSolver<T_Config>::MSBlockMultiColorGSSolver(AMG_Config &cfg, const std::string &cfg_scope)
-{
-    this->alpha = cfg.template getParameter<int>("alpha", cfg_scope);
-    this->block_size = cfg.template getParameter<int>("block_size", cfg_scope);
-    this->warp_size = cfg.template getParameter<int>("warp_size", cfg_scope);
-    this->omega = cfg.template getParameter<ValueType>("omega", cfg_scope);
+template <typename T>
+__device__ __forceinline__ T ldg(const T* ptr) {
+#if __CUDA_ARCH__ >= 300
+    return __ldg(ptr);
+#else
+    return *ptr;
+#endif
 }
 
-__global__ void ms_bmc_jacobi_kernel(const int *row_ptr, const int *col_ind, const float *values,
-                                     const float *b, const float *x_old, float *x_new,
-                                     const int *row_ids, int block_size, int alpha, float omega)
+template <typename T>
+__device__ __forceinline__ T fused_multiply_add(T a, T b, T c) {
+    return a * b + c;
+}
+
+template <typename ValueType>
+__global__ void ms_bmc_jacobi_kernel(const int *row_ptr, const int *col_ind, const ValueType *values,
+                                     const ValueType *b, const ValueType *x_old, ValueType *x_new,
+                                     const int *row_ids, int block_size, int alpha, ValueType omega)
 {
     int warp_id = blockIdx.x;
     int lane_id = threadIdx.x % 32;
 
-    extern __shared__ float x_shared[];
+    extern __shared__ ValueType x_shared[];
 
     for (int rep = 0; rep < alpha; ++rep)
     {
         for (int i = lane_id; i < block_size; i += 32)
         {
             int row = row_ids[warp_id * block_size + i];
-            float diag = 0.0f;
-            float sum = 0.0f;
+            ValueType diag = 0.0;
+            ValueType sum = 0.0;
 
             for (int jj = row_ptr[row]; jj < row_ptr[row + 1]; ++jj)
             {
                 int col = col_ind[jj];
-                float val = __ldg(&values[jj]);
+                ValueType val = ldg(&values[jj]);
                 if (col == row)
                     diag = val;
                 else
-                    sum += val * __ldg(&x_old[col]);
+                    sum += val * ldg(&x_old[col]);
             }
 
-            float gs_update = (b[row] - sum) / diag;
-            x_shared[i] = fmaf(omega, gs_update - x_old[row], x_old[row]);
+            ValueType gs_update = (b[row] - sum) / diag;
+            x_shared[i] = fused_multiply_add(omega, gs_update - x_old[row], x_old[row]);
         }
         __syncthreads();
 
@@ -65,19 +71,23 @@ __global__ void ms_bmc_jacobi_kernel(const int *row_ptr, const int *col_ind, con
         }
         __syncthreads();
 
-        float *tmp = (float *)x_old;
+        ValueType *tmp = (ValueType *)x_old;
         x_old = x_new;
         x_new = tmp;
     }
 }
 
-template <class T_Config>
-bool MSBlockMultiColorGSSolver<T_Config>::solve_iteration(ValueType &b, ValueType &x, bool xIsZero)
+template <AMGX_MemorySpace t_memSpace, AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+bool MSBlockMultiColorGSSolver<TemplateConfig<t_memSpace, t_vecPrec, t_matPrec, t_indPrec>>::solve_iteration(
+    typename TemplateConfig<t_memSpace, t_vecPrec, t_matPrec, t_indPrec>::VecPrec &b,
+    typename TemplateConfig<t_memSpace, t_vecPrec, t_matPrec, t_indPrec>::VecPrec &x,
+    bool xIsZero)
 {
-    using IndexType = typename T_Config::IndPrec;
-    using Value = typename T_Config::VecPrec;
+    typedef TemplateConfig<t_memSpace, t_vecPrec, t_matPrec, t_indPrec> TConfig;
+    typedef typename TConfig::IndPrec IndexType;
+    typedef typename TConfig::VecPrec ValueType;
 
-    const Matrix<T_Config> &A = *(this->matrix);
+    const Matrix<TConfig> &A = *(this->matrix);
     const int num_rows = A.get_num_rows();
 
     std::vector<int> row_ids;
@@ -93,30 +103,30 @@ bool MSBlockMultiColorGSSolver<T_Config>::solve_iteration(ValueType &b, ValueTyp
     }
 
     int *d_row_ptr, *d_col_ind, *d_row_ids;
-    float *d_vals, *d_x0, *d_x1, *d_b;
+    ValueType *d_vals, *d_x0, *d_x1, *d_b;
 
     cudaMalloc(&d_row_ptr, sizeof(int) * (num_rows + 1));
     cudaMalloc(&d_col_ind, sizeof(int) * A.get_num_nz());
-    cudaMalloc(&d_vals, sizeof(float) * A.get_num_nz());
-    cudaMalloc(&d_x0, sizeof(float) * num_rows);
-    cudaMalloc(&d_x1, sizeof(float) * num_rows);
-    cudaMalloc(&d_b, sizeof(float) * num_rows);
+    cudaMalloc(&d_vals, sizeof(ValueType) * A.get_num_nz());
+    cudaMalloc(&d_x0, sizeof(ValueType) * num_rows);
+    cudaMalloc(&d_x1, sizeof(ValueType) * num_rows);
+    cudaMalloc(&d_b, sizeof(ValueType) * num_rows);
     cudaMalloc(&d_row_ids, sizeof(int) * row_ids.size());
 
     cudaMemcpy(d_row_ptr, A.row_offsets.raw(), sizeof(int) * (num_rows + 1), cudaMemcpyHostToDevice);
     cudaMemcpy(d_col_ind, A.col_indices.raw(), sizeof(int) * A.get_num_nz(), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_vals, A.values.raw(), sizeof(float) * A.get_num_nz(), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_x0, x.raw(), sizeof(float) * num_rows, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, b.raw(), sizeof(float) * num_rows, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_vals, A.values.raw(), sizeof(ValueType) * A.get_num_nz(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_x0, x.raw(), sizeof(ValueType) * num_rows, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, b.raw(), sizeof(ValueType) * num_rows, cudaMemcpyHostToDevice);
     cudaMemcpy(d_row_ids, row_ids.data(), sizeof(int) * row_ids.size(), cudaMemcpyHostToDevice);
 
     dim3 grid(num_blocks);
     dim3 block(warp_size);
-    size_t shmem = sizeof(float) * block_size;
+    size_t shmem = sizeof(ValueType) * block_size;
 
-    ms_bmc_jacobi_kernel<<<grid, block, shmem>>>(d_row_ptr, d_col_ind, d_vals, d_b, d_x0, d_x1, d_row_ids, block_size, alpha, omega);
+    ms_bmc_jacobi_kernel<ValueType><<<grid, block, shmem>>>(d_row_ptr, d_col_ind, d_vals, d_b, d_x0, d_x1, d_row_ids, block_size, alpha, omega);
 
-    cudaMemcpy(x.raw(), d_x0, sizeof(float) * num_rows, cudaMemcpyDeviceToHost);
+    cudaMemcpy(x.raw(), d_x0, sizeof(ValueType) * num_rows, cudaMemcpyDeviceToHost);
 
     cudaFree(d_row_ptr);
     cudaFree(d_col_ind);
@@ -129,8 +139,8 @@ bool MSBlockMultiColorGSSolver<T_Config>::solve_iteration(ValueType &b, ValueTyp
     return true;
 }
 
-template <class T_Config>
-void MSBlockMultiColorGSSolver<T_Config>::print_solver_parameters() const
+template <AMGX_MemorySpace t_memSpace, AMGX_VecPrecision t_vecPrec, AMGX_MatPrecision t_matPrec, AMGX_IndPrecision t_indPrec>
+void MSBlockMultiColorGSSolver<TemplateConfig<t_memSpace, t_vecPrec, t_matPrec, t_indPrec>>::print_solver_parameters() const
 {
     std::cout << "MS-BMC-GS solver parameters:" << std::endl;
     std::cout << "  alpha: " << alpha << std::endl;
@@ -142,8 +152,5 @@ void MSBlockMultiColorGSSolver<T_Config>::print_solver_parameters() const
 #define AMGX_CASE_LINE(CASE) template class MSBlockMultiColorGSSolver<CASE>;
 AMGX_FORALL_BUILDS(AMGX_CASE_LINE)
 #undef AMGX_CASE_LINE
-
-#define AMGX_DECLARE_FACTORY(CASE) \ 
-    template void MSBlockMultiColorGSSolver<CASE>::registerFactory();
 
 } // namespace amgx
